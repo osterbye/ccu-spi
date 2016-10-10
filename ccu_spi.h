@@ -19,14 +19,13 @@
 #define _CCU_SPI_H_
 
 /* ioctls */
-#define CCU_SPI_SYNC_READ      _IOW('F', 1, int)
+//#define CCU_SPI_SYNC_READ      _IOW('F', 1, int)
 
-#if 0
+
 struct ccu_spi_platform_data {
-	unsigned long rtr_gpio;
-	unsigned long cts_gpio;
+	unsigned rtr_gpio;
+	unsigned cts_gpio;
 };
 
-#endif
 
 #endif /* _CCU_SPI_H_ */

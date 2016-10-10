@@ -15,23 +15,24 @@
  *
  ******************************************************************************/
 
-#include <linux/device.h>
-#include <linux/fs.h>
-#include <linux/kernel.h>
-#include <linux/delay.h>
-#include <linux/slab.h>
+//#include <linux/device.h>
+//#include <linux/fs.h>
+//#include <linux/kernel.h>
+//#include <linux/delay.h>
+//#include <linux/slab.h>
 //#include <linux/gpio.h>
+#include <linux/of_gpio.h>
 #include <linux/spi/spi.h>
 #include <linux/module.h>
-//#include <linux/interrupt.h>
-#include <linux/unistd.h>
-#include <linux/workqueue.h>
-#include <linux/sched.h>
+#include <linux/interrupt.h>
+//  #include <linux/unistd.h>
+//#include <linux/workqueue.h>
+//  #include <linux/sched.h>
 #include <linux/miscdevice.h>
 #include <linux/poll.h>
 
 #include <asm/ioctls.h>
-#include <asm/uaccess.h>
+//#include <asm/uaccess.h>
 
 #include "ccu_spi.h"
 
@@ -41,20 +42,18 @@
 
 
 struct ccu_spi_drvdata {
-	struct spi_device *spi;
-	struct workqueue_struct *workqueue;
-	struct work_struct	irq_work;
-	wait_queue_head_t data_queue;
-	u8 rx_buffer[MAX_READ_BUFFER_LEN];
-	u16 rx_buffer_len;
-	u8 tx_buffer[MAX_WRITE_BUFFER_LEN];
-	u16 tx_buffer_len;
-	u32 read_timer_interval_jiffies;
-	u32 read_timer_base_jiffies;
-	struct timer_list read_timer;
-	struct completion read_timer_done;
-	u8 exit;
-	u8 customers;
+    struct spi_device *spi;
+    struct workqueue_struct *workqueue;
+    struct work_struct	irq_work;
+    wait_queue_head_t data_queue;
+    u8 rx_buffer[MAX_READ_BUFFER_LEN];
+    u16 rx_buffer_len;
+    u8 tx_buffer[MAX_WRITE_BUFFER_LEN];
+    u16 tx_buffer_len;
+    u32 cts_gpio;
+    u32 dr_irq;
+    u8 exit;
+    u8 customers;
 };
 
 static struct ccu_spi_drvdata *ccu_spi_drvdata;
@@ -75,7 +74,7 @@ static void pr_buff(u8 *caption, u8 *buff, int len)
 #endif
 
 
-static void write_to_uc(void)
+/*static void write_to_uc(void)
 {
     int ret;
 
@@ -85,8 +84,8 @@ static void write_to_uc(void)
         return;
     }
     ccu_spi_drvdata->tx_buffer_len = 0;
-    mod_timer(&ccu_spi_drvdata->read_timer, jiffies+msecs_to_jiffies(10));
-}
+    //mod_timer(&ccu_spi_drvdata->read_timer, jiffies+msecs_to_jiffies(10));
+}*/
 
 static void read_from_uc(struct work_struct *work)
 {
@@ -110,6 +109,21 @@ static void read_from_uc(struct work_struct *work)
     //printk("\n[ccu_spi] read_from_uc - end\n\n\n");
 }
 
+// TODO: add gpio interrupt function that queues the reading function on the work queue.
+irqreturn_t dr_interrupt_handler(int irq, void *dev_id)
+{
+	printk(KERN_DEBUG "interrupt received (irq: %d)\n", irq);
+
+	if (irq == gpio_to_irq(ccu_spi_drvdata->dr_irq)) {
+			printk(KERN_DEBUG "[ccu_spi] Data ready interrupt received, queueing work READ\n");
+			queue_work(ccu_spi_drvdata->workqueue, &ccu_spi_drvdata->irq_work);
+			return IRQ_HANDLED;
+	}
+
+	return IRQ_HANDLED;
+}
+
+#if 0
 static u32 read_timer_next_timeout(void)
 {
     return ((((jiffies - ccu_spi_drvdata->read_timer_base_jiffies) / ccu_spi_drvdata->read_timer_interval_jiffies) + 1) * ccu_spi_drvdata->read_timer_interval_jiffies) + ccu_spi_drvdata->read_timer_base_jiffies;
@@ -126,17 +140,21 @@ static void read_timer_func(unsigned long data)
         mod_timer(&ccu_spi_drvdata->read_timer, read_timer_next_timeout());
     }
 }
+#endif
 
-static ssize_t ccu_spi_read(struct file *file, char __user *buff, size_t len, loff_t *offset)
+static ssize_t 
+ccu_spi_read(struct file *file, char __user *buff, size_t len, loff_t *offset)
 {
     int ret;
     //printk("[ccu_spi] enter READ function\n");
-    ret = wait_event_interruptible(ccu_spi_drvdata->data_queue, (0 != ccu_spi_drvdata->rx_buffer_len));
+    ret = wait_event_interruptible(ccu_spi_drvdata->data_queue, 
+            (0 != ccu_spi_drvdata->rx_buffer_len));
 
     if (unlikely(ret))
         goto out;
 
-    if (unlikely(copy_to_user(buff, &ccu_spi_drvdata->rx_buffer, ccu_spi_drvdata->rx_buffer_len))) {
+    if (unlikely(copy_to_user(buff, &ccu_spi_drvdata->rx_buffer, 
+                    ccu_spi_drvdata->rx_buffer_len))) {
         dev_err(&ccu_spi_drvdata->spi->dev, 
             "[ccu_spi] Failed to copy rx_buffer to user space\n");
         ret = -EFAULT;
@@ -151,33 +169,43 @@ out:
     return ret;
 }
 
-static ssize_t ccu_spi_write(struct file *file, const char __user *buff, size_t len, loff_t *offset)   
+static ssize_t ccu_spi_write(struct file *file, const char __user *buff, 
+                size_t len, loff_t *offset)   
 {
     //printk("[ccu_spi] Trying to write %d bytes. TX buffer already contains %d bytes\n", len, ccu_spi_drvdata->tx_buffer_len);
-    if (unlikely((len+ccu_spi_drvdata->tx_buffer_len) > MAX_WRITE_BUFFER_LEN))
+    if (unlikely(len > MAX_WRITE_BUFFER_LEN))
         return -ENOMEM;
 
-    if (unlikely(copy_from_user(&ccu_spi_drvdata->tx_buffer[ccu_spi_drvdata->tx_buffer_len], buff, len))) {
+    if (unlikely(copy_from_user(&ccu_spi_drvdata->tx_buffer[0], buff, len))) {
         dev_err(&ccu_spi_drvdata->spi->dev, 
             "[ccu_spi] Failed to copy tx_buffer from user space\n");
         return -EFAULT;
     }
-    ccu_spi_drvdata->tx_buffer_len += len;
+    ccu_spi_drvdata->tx_buffer_len = len;
 
-    write_to_uc();
+    if (gpio_get_value(ccu_spi_drvdata->cts_gpio))
+        return -EBUSY;
+    
+    if (unlikely(spi_write(ccu_spi_drvdata->spi, ccu_spi_drvdata->tx_buffer, 
+                                            ccu_spi_drvdata->tx_buffer_len))) {
+        dev_err(&ccu_spi_drvdata->spi->dev, "[ccu_spi] Failed SPI write.\n");
+        return -EIO;
+    }
+
     return len;
 }
 
-static long ccu_spi_ioctl(struct file *file, unsigned int cmd, unsigned long arg)   
+static long 
+ccu_spi_ioctl(struct file *file, unsigned int cmd, unsigned long arg)   
 {
     switch (cmd) {
-    case CCU_SPI_SYNC_READ:
+    /*case CCU_SPI_SYNC_READ:
         if (arg < 0x64 || arg > 0xFFFFFFFF)
             return -EFAULT;
         ccu_spi_drvdata->read_timer_base_jiffies = jiffies;
         ccu_spi_drvdata->read_timer_interval_jiffies = msecs_to_jiffies(arg);
         mod_timer(&ccu_spi_drvdata->read_timer, jiffies+1);
-        break;
+        break;*/
     case FIONREAD:
         printk("[ccu_spi] returning buffer len %d\n", ccu_spi_drvdata->rx_buffer_len);
         *(unsigned int *)arg = ccu_spi_drvdata->rx_buffer_len;
@@ -190,6 +218,7 @@ static long ccu_spi_ioctl(struct file *file, unsigned int cmd, unsigned long arg
     return 0;
 }
 
+//TODO: is the poll function needed?
 static unsigned int ccu_spi_poll(struct file *file, poll_table * wait)
 {
     unsigned int mask = 0;
@@ -206,30 +235,22 @@ static int ccu_spi_open(struct inode *inode, struct file *file)
     printk("[ccu_spi] opened\n");
     ccu_spi_drvdata->exit = 0;
     ccu_spi_drvdata->customers += 1;
-    if (1 == ccu_spi_drvdata->customers) {
-        init_completion(&ccu_spi_drvdata->read_timer_done);
-        setup_timer(&ccu_spi_drvdata->read_timer, read_timer_func, 0);
-        ccu_spi_drvdata->read_timer_base_jiffies = jiffies;
-        mod_timer(&ccu_spi_drvdata->read_timer, read_timer_next_timeout());
-    }
+    //TODO: set up gpio interrupt
     return 0;
 }   
    
 static int ccu_spi_release(struct inode *inode, struct file *file)   
 {
     // TODO: Create a proper "I'm leaving now" message.
-    u8 power_off[] = {0xB5, 0x62, 0x02, 0x41, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4B, 0x33};
+    //u8 power_off[] = {0xB5, 0x62, 0x02, 0x41, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4B, 0x33};
 
     printk("[ccu_spi] release\n");
     ccu_spi_drvdata->customers -= 1;
     if (ccu_spi_drvdata->customers <= 0) {
         ccu_spi_drvdata->exit = 1;
         ccu_spi_drvdata->customers = 0;
-        mod_timer(&ccu_spi_drvdata->read_timer, jiffies + 1);
-        wait_for_completion(&ccu_spi_drvdata->read_timer_done);
-        del_timer(&ccu_spi_drvdata->read_timer);
-        //gpio_direction_output(pdata->shutdown_gpio, 1);
-        spi_write(ccu_spi_drvdata->spi, power_off, sizeof(power_off));
+        //TODO: delete gpio interrupt
+        //spi_write(ccu_spi_drvdata->spi, power_off, sizeof(power_off));
         printk("[ccu_spi] released\n");
     }
     return 0;   
@@ -252,25 +273,81 @@ static struct miscdevice ccu_spi_miscdev =
      .fops  = &ccu_spi_fops   
 };   
 
+#ifdef CONFIG_OF_GPIO
+/*
+ * Translate OpenFirmware node properties into platform_data.
+ */
+static int
+ccu_spi_get_of_pdata(struct device *dev, struct ccu_spi_platform_data *pdata)
+{
+	struct device_node *np = dev->of_node;
+	int ret;
+	
+	ret = of_get_named_gpio(np, "rtr-gpio", 0);
+	if (ret < 0)
+		return ret;
+	pdata->rtr_gpio = ret;
+
+	ret = of_get_named_gpio(np, "cts-gpio", 0);
+	if (ret < 0)
+		return ret;
+	pdata->cts_gpio = ret;
+
+
+
+	//if (!gpio_is_valid(pdata->cts-gpio))
+		//return -ENODEV;
+
+	/*ret = gpio_request(pdata->cts-gpio, "cci-spi-cts-gpio");
+	if (ret < 0) {
+		dev_err(&client->dev, "request gpio failed: %d\n", ret);
+		return ret;
+	}
+
+	// controller should be waken up, return irq.  
+	gpio_direction_input(gpio);*/
+
+
+	return 0;
+}
+
+static const struct of_device_id of_ccu_spi_match[] = {
+	{ .compatible = "spiri,ccu_spi", },
+	{},
+};
+#endif /* CONFIG_OF_GPIO */
+
 static int ccu_spi_probe(struct spi_device *spi)
 {
+	struct ccu_spi_platform_data *pdata = dev_get_platdata(&spi->dev);
 	int ret;
 	
 	printk("[ccu_spi] Probing...\n");
 
-    // Request shutdown gpio
-	/*if (pdata != NULL) {
-		ret = gpio_request(pdata->shutdown_gpio, "Si446x Shutdown");
-		if (ret)
-			return ret;
+#ifdef CONFIG_OF_GPIO
+	if (!pdata) {
+		pdata = devm_kzalloc(&spi->dev,
+				     sizeof(struct ccu_spi_platform_data), GFP_KERNEL);
+		if (!pdata) {
+			ret = -ENOMEM;
+			goto err;
+		}
+			
 
-		ret = gpio_direction_output(pdata->shutdown_gpio, 1);
+		ret = ccu_spi_get_of_pdata(&spi->dev, pdata);
 		if (ret)
 			goto err;
-	}*/
+	}
+#else
+	if (!pdata) {
+		ret = -EINVAL;
+		goto err;
+	}
+#endif /* CONFIG_OF_GPIO */
 
     // Allocate mem for driver data
-	ccu_spi_drvdata = kzalloc(sizeof(struct ccu_spi_drvdata), GFP_KERNEL);
+	ccu_spi_drvdata = devm_kzalloc(&spi->dev,
+	                        sizeof(struct ccu_spi_drvdata), GFP_KERNEL);
 	if (ccu_spi_drvdata == NULL) {
 		dev_err(&spi->dev, "Failed to allocate memory for driver data\n");
 		ret = -ENOMEM;
@@ -280,7 +357,20 @@ static int ccu_spi_probe(struct spi_device *spi)
 	ccu_spi_drvdata->tx_buffer_len = 0;
 	ccu_spi_drvdata->exit = 0;
 	ccu_spi_drvdata->customers = 0;
-	ccu_spi_drvdata->read_timer_interval_jiffies = msecs_to_jiffies(1000);
+
+    // Request CTS gpio
+	if (!gpio_is_valid(pdata->cts_gpio)) {
+		ret = -ENODEV;
+		goto err;
+	}
+
+    ret = devm_gpio_request_one(&spi->dev, pdata->cts_gpio, 
+            GPIOF_DIR_IN, "cts-gpio");
+	if (ret) {
+		dev_err(&spi->dev, "[ccu_spi] Failed to setup CTS GPIO\n");
+		goto err;
+	}
+    ccu_spi_drvdata->cts_gpio = pdata->cts_gpio;
 
     // Setup SPI and defered work queue
 	spi->mode = SPI_MODE_0;
@@ -306,6 +396,7 @@ static int ccu_spi_probe(struct spi_device *spi)
 		dev_err(&spi->dev, "Failed to request irq\n");
 		goto err2;
 	}*/
+	
 
     // TODO: Test for uC presence
 
@@ -353,7 +444,7 @@ static int ccu_spi_remove(struct spi_device *spi)
 	/*if (pdata != NULL)
 		gpio_free(pdata->shutdown_gpio);*/
 
-	kfree(ccu_spi_drvdata);
+	//kfree(ccu_spi_drvdata);
 
 	return 0;
 }
@@ -362,6 +453,7 @@ static struct spi_driver ccu_spi_driver = {
 	.driver = {
 		.name	= "spiri_ccu",
 		.owner	= THIS_MODULE,
+		.of_match_table	= of_match_ptr(of_ccu_spi_match),
 	},
 	.probe		= ccu_spi_probe,
 	.remove		= ccu_spi_remove,
@@ -382,4 +474,5 @@ module_exit(ccu_spi_exit);
 
 MODULE_AUTHOR("Nikolaj Due Oesterbye <ndo@spiri.io>");
 MODULE_DESCRIPTION("Spiri internal CCU SPI communication");
+MODULE_LICENSE("GPL");
 
